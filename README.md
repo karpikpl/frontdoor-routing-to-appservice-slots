@@ -1,142 +1,395 @@
-# frontdoor-routing
+# Front Door → App Service Slots (via nginx)
 
-AZD-deployed Bicep stack: **Azure Front Door Premium** → **App Service (Linux .NET 8, blue/green slots, private link)**, with a **second AFD route** through an **nginx Container App** that proxies to either the production or staging slot — keeping all traffic private end-to-end.
+> **The problem this repo solves:** Azure Front Door's Private Link integration with App Service **does not support deployment slots** — only the production site can be a Private Link origin. So if you want the slot benefits (instant blue/green swap, pre-production smoke testing on the same plan) **and** you want all traffic to stay private end-to-end, AFD alone can't do it. This repo demonstrates how to bridge that gap with a tiny **nginx Container App** that AFD reaches over Private Link and that forwards into slot private endpoints over the VNet.
+>
+> Reference: [Microsoft Learn — *Connect Azure Front Door Premium to an App Service origin with Private Link*](https://learn.microsoft.com/en-us/azure/frontdoor/standard-premium/how-to-enable-private-link-web-app):
+> > *"This feature isn't supported with App Service Slots."*
+
+---
+
+## Why?
+
+Deployment slots are the standard PaaS pattern for blue/green on App Service: deploy to `staging`, smoke-test the slot's private endpoint, then `swap` instantly to production. They're cheap (run on the same App Service plan) and the swap is near-zero-downtime.
+
+Front Door Premium is the standard way to expose an App Service publicly without giving it a public network endpoint — its **Shared Private Link** feature creates a private endpoint that only AFD can use, so the App Service stays `publicNetworkAccess: Disabled`.
+
+The catch: AFD's SPL integration with App Service is hard-coded to the `sites` sub-resource. **You can't create a Shared Private Link from AFD to the `sites/slots/<slot-name>` sub-resource.** The portal won't list slots, ARM rejects the request, and the [docs explicitly call it out](https://learn.microsoft.com/en-us/azure/frontdoor/standard-premium/how-to-enable-private-link-web-app). The workarounds people typically reach for all have downsides:
+
+| Workaround | Downside |
+|---|---|
+| Give the staging slot a public URL | Defeats the point of `publicNetworkAccess: Disabled` |
+| Skip slots, use two separate Web Apps instead | Loses the `swap` semantics, doubles your App Service plan footprint, no shared config / sticky settings |
+| Put App Gateway in front instead of AFD | App Gateway *does* support a private endpoint per slot, but you lose AFD's global anycast, edge caching, and global WAF |
+| Use AFD with public origins + IP restrictions | Origin is still on the internet; trades private networking for a deny-list |
+
+So we keep both AFD's Private Link **and** real App Service slots, and put a thin intermediary in between:
+
+1. AFD has a Shared Private Link to a **Container Apps environment** (which *is* supported as an SPL target).
+2. That Container App runs **stock nginx** and reaches the App Service slots over the VNet via their **own** private endpoints (`pe-app-prod` and `pe-app-staging`). The slot PE is fine — *App Service itself* fully supports per-slot private endpoints; it's only **AFD's** SPL that doesn't.
+3. AFD's Rules Engine tells nginx which slot to hit by appending an `X-Backend-Host` request header per route.
+
+End result: every public byte rides AFD → SPL → nginx → VNet → slot PE. Nothing on either app is reachable from the public internet.
+
+---
 
 ## Topology
 
 ```
-                         ┌──────────────────────────────────┐
-                         │  Azure Front Door Premium        │
-                         │  (global, no WAF)                │
-                         └──┬──────────────────────────┬────┘
-        Route /direct/*     │                          │   Route /* (catch-all)
-        SPL groupId: sites  │                          │   SPL groupId: managedEnvironments
-                            ▼                          ▼
-                ┌─────────────────────────┐   ┌──────────────────────────────┐
-                │  App Service (Linux S1) │   │  Container App: nginx:1.27   │
-                │  .NET 8 sample app      │   │  (workload-profile env,      │
-                │  PNA: Disabled          │   │   internal, PNA: Disabled)   │
-                │  Private endpoints:     │   │  Init container renders      │
-                │   - sites               │   │  nginx.conf via envsubst     │
-                │   - sites-staging       │   └──────────┬───────────────────┘
-                └───────────┬─────────────┘              │
-                            │                            │  proxy_pass over
-                            │                            │  privatelink DNS
-                            ▼                            ▼
-                ┌─────────────────────────────────────────────┐
-                │  App Service prod slot  /  staging slot     │
-                │  Same image, blue/green via slot-sticky     │
-                │  env vars (SLOT_ROLE, DEPLOYMENT_COLOR,     │
-                │   ACTIVE_SLOT_NAME).                        │
-                └─────────────────────────────────────────────┘
+                       ┌──────────────────────────────────────┐
+                       │  Azure Front Door Premium            │
+                       │  Rules Engine appends per-route:     │
+                       │    X-Backend-Host: <slot-fqdn>       │
+                       └──┬───────────────┬──────────────┬────┘
+                          │               │              │
+                  Shared Private Link to each origin (only path to origins)
+                          │               │              │
+            /direct/*     │   /ui/*       │       /* and /staging/*
+       (prod slot only —  │  (Entra MVC)  │
+        AFD's "native"    │               │
+        SPL path)         │               │
+                          ▼               ▼              ▼
+        ┌─────────────────────────┐  ┌──────────┐  ┌──────────────────────┐
+        │ App Service (Linux S1)  │  │ UI app   │  │ nginx Container App  │
+        │ .NET 8 minimal API      │  │ ASP.NET  │  │ reads X-Backend-Host │
+        │  ├─ prod slot  (blue)   │  │ MVC +    │  │ proxy_pass to that   │
+        │  └─ staging slot (green)│  │ Entra ID │  │ FQDN over Priv.Link  │
+        │  PublicNetworkAccess:   │  └────┬─────┘  └───────────┬──────────┘
+        │   Disabled              │       │                    │
+        │  Private endpoints:     │       │                    │
+        │   pe-app-prod   (sites) │       │                    │
+        │   pe-app-staging        │       │                    │
+        │     (sites-staging)     │       │                    │
+        │   ▲                     │       │                    │
+        │   │ both PEs reachable  │       │                    │
+        │   │ from the VNet —     │       │                    │
+        │   │ but AFD's SPL       │       │                    │
+        │   │ only lands on prod  │       │                    │
+        └───┴─────────────────────┘       │                    │
+                                          │                    │
+                  ─────────────────────── VNet ─────────────────┘
 ```
 
-### Route behavior
+Key point: **AFD's SPL gives it a private path to *only* the production slot.** Reaching the staging slot privately requires a hop through something else in the VNet that *can* see both PEs — that's nginx.
 
-| Front Door URL                            | Path inside cluster                                       | Lands on              |
-| ----------------------------------------- | --------------------------------------------------------- | --------------------- |
-| `https://<afd>/direct/...`                | AFD strips `/direct` → App Service                        | **production slot**   |
-| `https://<afd>/...` (catch-all)           | nginx Container App → `/...` → prod hostname              | **production slot**   |
-| `https://<afd>/staging/...`               | nginx Container App → strips `/staging` → staging hostname| **staging slot**      |
+---
 
-### Blue/green via slot-sticky settings
+## How the slot-aware routing works
 
-`app-service.bicep` marks `SLOT_ROLE`, `DEPLOYMENT_COLOR`, `ACTIVE_SLOT_NAME` as **slot-sticky** (via `Microsoft.Web/sites/config/slotConfigNames`). The values stay tied to the slot they were set on:
+The clever bit is on AFD, not on nginx.
 
-| Setting            | Production slot | Staging slot |
-| ------------------ | --------------- | ------------ |
-| `SLOT_ROLE`        | `main`          | `staging`    |
-| `DEPLOYMENT_COLOR` | `blue`          | `green`      |
-| `ACTIVE_SLOT_NAME` | `production`    | `staging`    |
+For every nginx-bound route, AFD runs a one-rule **rule set** that appends a request header naming the backend host:
 
-After `az webapp deployment slot swap`, the previously-staging instance becomes production (still serves the `staging`/`green` env vars), so `/direct/` and `/` start serving green content and `/staging/` starts serving blue — public AFD URL unchanged.
+```bicep
+// /staging and /staging/* route
+{
+  name: 'ModifyRequestHeader'
+  parameters: {
+    headerAction: 'Append'                 // ← see "gotchas" below
+    headerName:   'X-Backend-Host'
+    value:        'app-fdr-...-staging.azurewebsites.net'
+  }
+}
+```
+
+nginx is a transparent proxy — it never knows there are two slots, it just reads the header and forwards:
+
+```nginx
+location / {
+    if ($http_x_backend_host = "") { return 400; }                # AFD must inject
+    if ($http_x_backend_host !~* "\.azurewebsites\.net$") { return 400; }  # SSRF guard
+    set $backend $http_x_backend_host;
+    proxy_set_header Host         $backend;
+    proxy_set_header X-Proxied-By "nginx-fdr";
+    proxy_pass https://$backend;
+}
+```
+
+The slot FQDN (`*-staging.azurewebsites.net`) resolves inside the VNet to the staging slot's private endpoint IP — via the `privatelink.azurewebsites.net` private DNS zone linked to the VNet. nginx never touches the public internet.
+
+**Why this is safe:** nginx is reachable *only* through AFD's Shared Private Link. There's no way for an end user to hit nginx directly and spoof `X-Backend-Host`. AFD's `Append` action runs at the edge, after the client request is fully terminated. The nginx config also allow-lists the header suffix as a belt-and-braces SSRF guard.
+
+**Adding a third slot / route?** It's two AFD primitives: a route (pattern → origin group) and a one-action rule set (`Append X-Backend-Host = <hostname>`). nginx doesn't change.
+
+---
+
+## What you get
+
+Four routes on a single Front Door endpoint:
+
+| Path | Origin | Notes |
+|------|--------|-------|
+| `/` (catch-all) | nginx → **production slot** | `X-Proxied-By: nginx-fdr` |
+| `/staging`, `/staging/*` | nginx → **staging slot** | nginx strips the `/staging` prefix |
+| `/direct/*` | App Service prod (no nginx) | AFD's "native" SPL path — works for prod only, by design |
+| `/ui/*` | ASP.NET MVC UI app | **Microsoft Entra ID** sign-in, redirect URI wired through AFD |
+
+The `.NET` sample app surfaces `SLOT_ROLE`, `DEPLOYMENT_COLOR` (blue/green), and `X-Proxied-By` so you can see exactly which slot you hit and whether nginx was in the path.
+
+---
+
+## Resources deployed
+
+- **Front Door Premium** profile, endpoint, 3 origin groups (`og-app`, `og-ui`, `og-nginx`), 4 routes, rule sets for header injection and `/direct` strip
+- **App Service Plan** (Linux, S1 — required for slots)
+  - `app-...` web app + `staging` deployment slot, each with its own private endpoint
+  - `app-ui-...` MVC web app for the Entra-protected UI
+- **Container Apps Environment** (workload-profile, internal) + `ca-nginx-...` Container App running stock `nginx:1.27`
+- **Virtual Network** with subnets for App Service PE, ACA, and AFD shared private endpoints
+- **Private DNS Zones**: `privatelink.azurewebsites.net`, `privatelink.<region>.azurecontainerapps.io`
+- **Log Analytics workspace** wired into all of the above
+- **Microsoft Entra app registration** for the UI app (created by AZD preprovision hook, redirect URI set in postprovision)
+
+Everything is in `infra/` (Bicep) and `azure.yaml` (AZD).
+
+---
 
 ## Quick start
 
-Prereqs: Azure CLI, [Azure Developer CLI (`azd`)](https://aka.ms/azd-install), .NET 8 SDK, `zip`.
+Prerequisites: [`azd`](https://aka.ms/azd), Azure CLI, .NET 8 SDK, an Azure subscription, and an Entra tenant where you can create an app registration.
 
 ```bash
+git clone <this repo>
 cd frontdoor-routing
 azd auth login
-azd env new fdr-dev
-azd env set AZURE_LOCATION eastus2
 azd up
 ```
 
-`azd up` runs in order:
+`azd up` will:
 
-1. **Provision** — Bicep deploys VNet, App Service + staging slot (with private endpoints), Container Apps env + nginx, Front Door Premium. **Shared Private Link** requests from AFD to both backends auto-approve.
-2. **Build & package** — azd packages `src/app` (.NET 8 minimal API).
-3. **Deploy** — `azd deploy` publishes to the **production slot**.
-4. **Postdeploy hook** — `dotnet publish` + `az webapp deploy --slot staging` ships the same artifact to the **staging slot**.
+1. Run the `preprovision` hook — captures your current public IP (for SCM allow-list) and creates / refreshes the Entra app registration for the UI app.
+2. `azd provision` — deploys all Bicep.
+3. `azd deploy` — publishes `src/app` to the production slot, then republishes it to the staging slot.
+4. Run the `postprovision` hook — sets the UI app's Entra redirect URI to `https://<afd-endpoint>/ui/signin-oidc`.
 
-After `azd up`, run:
-
-```bash
-./scripts/validate.sh
-```
-
-Or manually:
+When it finishes:
 
 ```bash
-AFD=$(azd env get-value AFD_ENDPOINT_HOSTNAME)
-curl "https://$AFD/direct/api/whoami"      # -> blue / main
-curl "https://$AFD/api/whoami"             # -> blue / main (via nginx)
-curl "https://$AFD/staging/api/whoami"     # -> green / staging (via nginx)
+afd=$(azd env get-value AFD_ENDPOINT_HOSTNAME)
+
+curl "https://$afd/api/whoami"            # → main / blue, proxiedBy: nginx-fdr
+curl "https://$afd/staging/api/whoami"    # → staging / green, proxiedBy: nginx-fdr
+curl "https://$afd/direct/api/whoami"     # → main / blue, direct (no nginx)
+open  "https://$afd/ui/"                  # → Microsoft Entra sign-in flow
 ```
 
-## Swap demo
+Swap slots and watch the same URL flip blue ↔ green:
 
 ```bash
-APP=$(azd env get-value APP_SERVICE_NAME)
-RG=$(azd env get-value AZURE_RESOURCE_GROUP)
-az webapp deployment slot swap --resource-group "$RG" --name "$APP" --slot staging
+az webapp deployment slot swap \
+  -g $(azd env get-value AZURE_RESOURCE_GROUP) \
+  -n $(azd env get-value APP_SERVICE_NAME) \
+  --slot staging
 ```
 
-Re-run the curl commands — now `/direct/` and `/` return **green** (the formerly-staging instance is now production), and `/staging/` returns **blue**.
+---
 
-## Parameters (in `infra/main.bicep`)
-
-| Param             | Default                          | Notes                                                |
-| ----------------- | -------------------------------- | ---------------------------------------------------- |
-| `location`        | `resourceGroup().location`       | Set via `AZURE_LOCATION` env var. Defaults `eastus2`.|
-| `prefix`          | `fdr`                            | Short prefix used in every resource name.            |
-| `env`             | `dev`                            | One of dev/uat/prd. Used in names + tags.            |
-| `resourceToken`   | `take(uniqueString(rg.id), 8)`   | Override only if you want deterministic names.       |
-| `environmentName` | `dev`                            | AZD environment name, applied as `azd-env-name` tag. |
-
-## Files
+## Repository layout
 
 ```
-frontdoor-routing/
-├── azure.yaml                    AZD config + postdeploy hook for slot deploy
-├── README.md
-├── src/app/                      Sample .NET 8 minimal-API app
-│   ├── frontdoor-sample.csproj
-│   ├── Program.cs                Reads SLOT_ROLE / DEPLOYMENT_COLOR / ACTIVE_SLOT_NAME
-│   └── appsettings.json
+.
+├── azure.yaml                       AZD config + pre/postprovision/deploy hooks
 ├── infra/
-│   ├── main.bicep                Root deployment (RG-scoped)
-│   ├── main.bicepparam
-│   ├── resourcenames.bicep       Deterministic naming
+│   ├── main.bicep                   subscription-scope: RG + everything else
+│   ├── main.bicepparam              env-derived parameters (IP, Entra IDs, …)
+│   ├── resourcenames.bicep          centralised naming
 │   └── modules/
-│       ├── vnet.bicep
-│       ├── monitoring.bicep
-│       ├── private-dns.bicep
-│       ├── app-service.bicep     ASP + Web App + staging slot + sticky settings
-│       ├── app-service-pe.bicep  PEs for groupIds `sites` + `sites-staging`
-│       ├── container-app-env.bicep
-│       ├── nginx-container-app.bicep   envsubst-based config injection
-│       └── front-door.bicep      AFD Premium + 2 origins + 2 routes + URL rewrite
-└── scripts/
-    └── validate.sh               curl smoke tests after azd up
+│       ├── network.bicep            VNet + subnets + private DNS zones
+│       ├── app-service.bicep        prod + staging slots, slot-sticky env, SCM allow-list
+│       ├── app-service-ui.bicep     UI MVC web app + private endpoint
+│       ├── container-apps-env.bicep ACA managed environment
+│       ├── nginx-container-app.bicep transparent header-driven proxy
+│       ├── front-door.bicep         profile, endpoint, origin groups, routes, rule sets
+│       └── log-analytics.bicep
+└── src/
+    ├── app/                         .NET 8 Minimal API: /api/whoami + slot HTML
+    └── ui/                          .NET 8 ASP.NET MVC + Microsoft.Identity.Web (Entra ID)
 ```
 
-## Notes & gotchas
+---
 
-- **No WAF** by design. Add one later by attaching a `Microsoft.Cdn/profiles/securityPolicies` resource linked to a `Microsoft.Network/frontdoorWebApplicationFirewallPolicies` (SKU Premium).
-- **Shared Private Link approval** — both App Service and Container Apps managed environments auto-approve SPL requests from AFD in the same tenant. If you ever cross tenants, add an `az network private-endpoint-connection approve` postdeploy step.
-- **App Service public access disabled** — direct `curl https://<webapp>.azurewebsites.net/` returns 403. All traffic must come through Front Door.
-- **App Service runtime DNS** — `vnetRouteAllEnabled: true` plus the regional VNet integration subnet lets the slots resolve each other's hostnames through the private DNS zone (used here only for the nginx side-route).
-- **nginx config** — held as a Container Apps secret; an `alpine:3.20` init container installs `gettext` and runs `envsubst` over an explicit whitelist (`$APP_PROD_HOST $APP_STAGING_HOST`) so nginx-native variables stay literal. Pattern lifted from a LiteLLM proxy in a sibling repo.
-- **Container Apps env workload profile** — `Consumption` for cost; switch to `D4` dedicated if you need consistent low-latency response (Consumption has cold starts).
+## Gotchas worth knowing
+
+These are the things that ate the most time while building this — calling them out so you don't repeat them.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Can't create an AFD Shared Private Link to a slot | [Not supported](https://learn.microsoft.com/en-us/azure/frontdoor/standard-premium/how-to-enable-private-link-web-app) — only the `sites` sub-resource is allowed | This whole repo 🙂 — route via an intermediary that *is* a supported SPL target (ACA) |
+| AFD rule says `ModifyRequestHeader Overwrite`, but header never reaches origin | `Overwrite` is a no-op when the header doesn't already exist on the request (despite what the docs imply) | Use `headerAction: 'Append'` |
+| AFD `UrlRewrite` action silently doesn't rewrite | Reliability issue with the rules engine for nginx-bound routes | Do path stripping in nginx (`rewrite ^/staging/(.*)$ /$1 break;`) |
+| `azd deploy` hangs forever on "Checking deployment slots" | `publicNetworkAccess: Disabled` also blocks SCM/Kudu (which azd talks to) | Set `publicNetworkAccess: Enabled` but use `ipSecurityRestrictions` deny-all on main + `scmIpSecurityRestrictions` allow `MY_IP` on SCM. AFD's Shared Private Link bypasses these IP rules. |
+| `azd deploy` errors with "deployment slots detected but no target specified" | azd 1.25+ requires explicit slot selection | `azd env set AZD_DEPLOY_APP_SLOT_NAME production` (handled by preprovision hook) |
+| "Cannot exceed the number of slots allowed for the 'Basic' SKU" | App Service Basic doesn't support slots | Use Standard (S1) or higher |
+| nginx returns absolute redirects with the internal ACA hostname | Default `absolute_redirect on` leaks listen host:port | `absolute_redirect off; port_in_redirect off;` |
+| nginx `set $foo …` after `rewrite … break;` is skipped | `break` ends the rewrite phase, including subsequent `set` directives in the same location | Put `set` **before** `rewrite` |
+| Container Apps doesn't restart when only the env-var value changes | Secret-only changes don't bump the revision | Set `revisionSuffix: 'cfg-${substring(uniqueString(template),0,8)}'` so a config-hash change forces a new revision |
+| AFD endpoint hostname has a random suffix (`-a2esgpe…`) | Anti-subdomain-takeover hash, non-deterministic | Read it from outputs **after** provision; the `postprovision` hook uses it to set the Entra redirect URI |
+
+---
+
+## Cleanup
+
+```bash
+azd down --purge
+```
+
+This deletes the resource group and purges the soft-deleted Front Door profile so the name is immediately reusable.
+
+---
+
+## How the slot-aware routing works
+
+The clever bit is on AFD, not on nginx.
+
+For every nginx-bound route, AFD runs a one-rule **rule set** that appends a request header naming the backend host:
+
+```bicep
+// /staging and /staging/* route
+{
+  name: 'ModifyRequestHeader'
+  parameters: {
+    headerAction: 'Append'                 // ← see "gotchas" below
+    headerName:   'X-Backend-Host'
+    value:        'app-fdr-...-staging.azurewebsites.net'
+  }
+}
+```
+
+nginx never knows there are two slots. It just reads the header and reverse-proxies:
+
+```nginx
+location / {
+    if ($http_x_backend_host = "") { return 400; }                # AFD must inject
+    if ($http_x_backend_host !~* "\.azurewebsites\.net$") { return 400; }  # SSRF guard
+    set $backend $http_x_backend_host;
+    proxy_set_header Host       $backend;
+    proxy_set_header X-Proxied-By "nginx-fdr";
+    proxy_pass https://$backend;
+}
+```
+
+**Why this is safe:** nginx is reachable *only* through AFD's Shared Private Link. There's no way for an end user to hit nginx directly and spoof `X-Backend-Host`. AFD's `Append` action runs at the edge, after the client request is fully terminated.
+
+**Adding a third slot / route?** It's two AFD primitives: a route (pattern → origin group) and a one-action rule set (`Append X-Backend-Host = <hostname>`). nginx doesn't change.
+
+---
+
+## What you get
+
+Four routes on a single Front Door endpoint:
+
+| Path | Origin | Notes |
+|------|--------|-------|
+| `/` (catch-all) | nginx → **production slot** | `X-Proxied-By: nginx-fdr` |
+| `/staging`, `/staging/*` | nginx → **staging slot** | nginx strips the `/staging` prefix |
+| `/direct/*` | App Service prod (no nginx) | Demonstrates the "without slot routing" baseline |
+| `/ui/*` | ASP.NET MVC UI app | **Microsoft Entra ID** sign-in, redirect URI wired through AFD |
+
+The `.NET` sample app surfaces `SLOT_ROLE`, `DEPLOYMENT_COLOR` (blue/green), and `X-Proxied-By` so you can see exactly which slot you hit and whether nginx was in the path.
+
+---
+
+## Resources deployed
+
+- **Front Door Premium** profile, endpoint, 3 origin groups (`og-app`, `og-ui`, `og-nginx`), 4 routes, rule sets for header injection and `/direct` strip
+- **App Service Plan** (Linux, S1 — required for slots)
+  - `app-...` web app + `staging` deployment slot
+  - `app-ui-...` MVC web app for the Entra-protected UI
+- **Container Apps Environment** (workload-profile, internal) + `ca-nginx-...` Container App running stock `nginx:1.27`
+- **Virtual Network** with subnets for App Service PE, ACA, and AFD shared private endpoints
+- **Private DNS Zones**: `privatelink.azurewebsites.net`, `privatelink.<region>.azurecontainerapps.io`
+- **Log Analytics workspace** wired into all of the above
+- **Microsoft Entra app registration** for the UI app (created by AZD preprovision hook, redirect URI set in postprovision)
+
+Everything is in `infra/` (Bicep) and `azure.yaml` (AZD).
+
+---
+
+## Quick start
+
+Prerequisites: [`azd`](https://aka.ms/azd), Azure CLI, .NET 8 SDK, an Azure subscription, and an Entra tenant where you can create an app registration.
+
+```bash
+git clone <this repo>
+cd frontdoor-routing
+azd auth login
+azd up
+```
+
+`azd up` will:
+
+1. Run the `preprovision` hook — captures your current public IP (for SCM allow-list) and creates / refreshes the Entra app registration for the UI app.
+2. `azd provision` — deploys all Bicep.
+3. `azd deploy` — publishes `src/app` to the production slot, then republishes it to the staging slot.
+4. Run the `postprovision` hook — sets the UI app's Entra redirect URI to `https://<afd-endpoint>/ui/signin-oidc`.
+
+When it finishes:
+
+```bash
+afd=$(azd env get-value AFD_ENDPOINT_HOSTNAME)
+
+curl "https://$afd/api/whoami"            # → main / blue, proxiedBy: nginx-fdr
+curl "https://$afd/staging/api/whoami"    # → staging / green, proxiedBy: nginx-fdr
+curl "https://$afd/direct/api/whoami"     # → main / blue, direct (no nginx)
+open  "https://$afd/ui/"                  # → Microsoft Entra sign-in flow
+```
+
+Swap slots and watch the same URL flip blue ↔ green:
+
+```bash
+az webapp deployment slot swap \
+  -g $(azd env get-value AZURE_RESOURCE_GROUP) \
+  -n $(azd env get-value APP_SERVICE_NAME) \
+  --slot staging
+```
+
+---
+
+## Repository layout
+
+```
+.
+├── azure.yaml                       AZD config + pre/postprovision/deploy hooks
+├── infra/
+│   ├── main.bicep                   subscription-scope: RG + everything else
+│   ├── main.bicepparam              env-derived parameters (IP, Entra IDs, …)
+│   ├── resourcenames.bicep          centralised naming
+│   └── modules/
+│       ├── network.bicep            VNet + subnets + private DNS zones
+│       ├── app-service.bicep        prod + staging slots, slot-sticky env, SCM allow-list
+│       ├── app-service-ui.bicep     UI MVC web app + private endpoint
+│       ├── container-apps-env.bicep ACA managed environment
+│       ├── nginx-container-app.bicep transparent header-driven proxy
+│       ├── front-door.bicep         profile, endpoint, origin groups, routes, rule sets
+│       └── log-analytics.bicep
+└── src/
+    ├── app/                         .NET 8 Minimal API: /api/whoami + slot HTML
+    └── ui/                          .NET 8 ASP.NET MVC + Microsoft.Identity.Web (Entra ID)
+```
+
+---
+
+## Gotchas worth knowing
+
+These are the things that ate the most time while building this — calling them out so you don't repeat them.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| AFD rule says `ModifyRequestHeader Overwrite`, but header never reaches origin | `Overwrite` is a no-op when the header doesn't already exist on the request (despite what the docs imply) | Use `headerAction: 'Append'` |
+| AFD `UrlRewrite` action silently doesn't rewrite | Reliability issue with the rules engine for nginx-bound routes | Do path stripping in nginx (`rewrite ^/staging/(.*)$ /$1 break;`) |
+| `azd deploy` hangs forever on "Checking deployment slots" | `publicNetworkAccess: Disabled` also blocks SCM/Kudu (which azd talks to) | Set `publicNetworkAccess: Enabled` but use `ipSecurityRestrictions` deny-all on main + `scmIpSecurityRestrictions` allow `MY_IP` on SCM. AFD's Shared Private Link bypasses these IP rules. |
+| `azd deploy` errors with "deployment slots detected but no target specified" | azd 1.25+ requires explicit slot selection | `azd env set AZD_DEPLOY_APP_SLOT_NAME production` (handled by preprovision hook) |
+| "Cannot exceed the number of slots allowed for the 'Basic' SKU" | App Service Basic doesn't support slots | Use Standard (S1) or higher |
+| nginx returns absolute redirects with the internal ACA hostname | Default `absolute_redirect on` leaks listen host:port | `absolute_redirect off; port_in_redirect off;` |
+| nginx `set $foo …` after `rewrite … break;` is skipped | `break` ends the rewrite phase, including subsequent `set` directives in the same location | Put `set` **before** `rewrite` |
+| Container Apps doesn't restart when only the env-var value changes | Secret-only changes don't bump the revision | Set `revisionSuffix: 'cfg-${substring(uniqueString(template),0,8)}'` so a config-hash change forces a new revision |
+| AFD endpoint hostname has a random suffix (`-a2esgpe…`) | Anti-subdomain-takeover hash, non-deterministic | Read it from outputs **after** provision; the `postprovision` hook uses it to set the Entra redirect URI |
+
+---
+
+## Cleanup
+
+```bash
+azd down --purge
+```
+
+This deletes the resource group and purges the soft-deleted Front Door profile so the name is immediately reusable.
