@@ -21,11 +21,18 @@ param frontDoorEndpointName string
 param appServiceResourceId string
 @description('App Service production-slot FQDN, e.g. app-fdr-dev-xxx.azurewebsites.net.')
 param appServiceHostName string
+@description('App Service staging-slot FQDN, e.g. app-fdr-dev-xxx-staging.azurewebsites.net. Injected into X-Backend-Host on the /staging route.')
+param appServiceStagingHostName string
 
 @description('Container Apps managed environment resource ID. Used as the SPL target with groupId=managedEnvironments.')
 param managedEnvironmentResourceId string
 @description('Container App FQDN (env-prefixed), e.g. ca-nginx-xxx.<token>.<region>.azurecontainerapps.io.')
 param nginxContainerAppHostName string
+
+@description('UI App Service resource ID (the parent site). Used as the SPL target with groupId=sites.')
+param appServiceUiResourceId string
+@description('UI App Service FQDN, e.g. app-ui-fdr-dev-xxx.azurewebsites.net.')
+param appServiceUiHostName string
 
 @description('Log Analytics workspace resource ID for AFD diagnostic settings.')
 param logAnalyticsWorkspaceId string
@@ -146,6 +153,51 @@ resource originNginx 'Microsoft.Cdn/profiles/originGroups/origins@2024-02-01' = 
 }
 
 // ---------------------------------------------------------------------------
+// Origin group + origin: UI App Service (Entra-protected MVC at /ui)
+// ---------------------------------------------------------------------------
+resource ogUi 'Microsoft.Cdn/profiles/originGroups@2024-02-01' = {
+  parent: profile
+  name: 'og-ui'
+  properties: {
+    loadBalancingSettings: {
+      sampleSize: 4
+      successfulSamplesRequired: 3
+      additionalLatencyInMilliseconds: 50
+    }
+    healthProbeSettings: {
+      probePath: '/ui/healthz'
+      probeRequestType: 'HEAD'
+      probeProtocol: 'Https'
+      probeIntervalInSeconds: 100
+    }
+    sessionAffinityState: 'Disabled'
+  }
+}
+
+resource originUi 'Microsoft.Cdn/profiles/originGroups/origins@2024-02-01' = {
+  parent: ogUi
+  name: 'origin-ui'
+  properties: {
+    hostName: appServiceUiHostName
+    originHostHeader: appServiceUiHostName
+    httpPort: 80
+    httpsPort: 443
+    priority: 1
+    weight: 1000
+    enabledState: 'Enabled'
+    enforceCertificateNameCheck: true
+    sharedPrivateLinkResource: {
+      groupId: 'sites'
+      privateLink: {
+        id: appServiceUiResourceId
+      }
+      privateLinkLocation: reference(appServiceUiResourceId, '2023-12-01', 'Full').location
+      requestMessage: 'Front Door to UI App Service — created by frontdoor-routing.'
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Rule set: strip "/direct" prefix before forwarding to App Service.
 // ---------------------------------------------------------------------------
 resource ruleSetDirect 'Microsoft.Cdn/profiles/ruleSets@2024-02-01' = {
@@ -168,6 +220,77 @@ resource ruleStripDirect 'Microsoft.Cdn/profiles/ruleSets/rules@2024-02-01' = {
           sourcePattern: '/direct'
           destination: '/'
           preserveUnmatchedPath: true
+        }
+      }
+    ]
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Rule set: route /staging/* through nginx, injecting X-Backend-Host so nginx
+// proxies to the staging slot. Also strips the /staging prefix so nginx sees
+// the original app path. Header is set with action=Overwrite, so any client-
+// supplied X-Backend-Host is discarded by AFD — nginx can trust it.
+// ---------------------------------------------------------------------------
+resource ruleSetNginxStaging 'Microsoft.Cdn/profiles/ruleSets@2024-02-01' = {
+  parent: profile
+  name: 'rsNginxStaging'
+}
+
+resource ruleNginxStaging 'Microsoft.Cdn/profiles/ruleSets/rules@2024-02-01' = {
+  parent: ruleSetNginxStaging
+  name: 'stripAndSetStagingHost'
+  properties: {
+    order: 1
+    matchProcessingBehavior: 'Continue'
+    conditions: []
+    actions: [
+      {
+        name: 'UrlRewrite'
+        parameters: {
+          typeName: 'DeliveryRuleUrlRewriteActionParameters'
+          sourcePattern: '/staging'
+          destination: '/'
+          preserveUnmatchedPath: true
+        }
+      }
+      {
+        name: 'ModifyRequestHeader'
+        parameters: {
+          typeName: 'DeliveryRuleHeaderActionParameters'
+          headerAction: 'Append'
+          headerName: 'X-Backend-Host'
+          value: appServiceStagingHostName
+        }
+      }
+    ]
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Rule set: catch-all route through nginx, injecting X-Backend-Host so nginx
+// proxies to the production slot. No path rewrite — pass through.
+// ---------------------------------------------------------------------------
+resource ruleSetNginxProd 'Microsoft.Cdn/profiles/ruleSets@2024-02-01' = {
+  parent: profile
+  name: 'rsNginxProd'
+}
+
+resource ruleNginxProd 'Microsoft.Cdn/profiles/ruleSets/rules@2024-02-01' = {
+  parent: ruleSetNginxProd
+  name: 'setProdHost'
+  properties: {
+    order: 1
+    matchProcessingBehavior: 'Continue'
+    conditions: []
+    actions: [
+      {
+        name: 'ModifyRequestHeader'
+        parameters: {
+          typeName: 'DeliveryRuleHeaderActionParameters'
+          headerAction: 'Append'
+          headerName: 'X-Backend-Host'
+          value: appServiceHostName
         }
       }
     ]
@@ -208,7 +331,66 @@ resource routeDirect 'Microsoft.Cdn/profiles/afdEndpoints/routes@2024-02-01' = {
   ]
 }
 
-// Route 2: /* -> nginx (catch-all).
+// Route 2: /ui/* -> UI App Service. More specific than /*, so it wins.
+// No URL rewrite — app uses UsePathBase("/ui") so the prefix flows through.
+resource routeUi 'Microsoft.Cdn/profiles/afdEndpoints/routes@2024-02-01' = {
+  parent: endpoint
+  name: 'route-ui'
+  properties: {
+    originGroup: {
+      id: ogUi.id
+    }
+    supportedProtocols: [
+      'Http'
+      'Https'
+    ]
+    patternsToMatch: [
+      '/ui/*'
+    ]
+    forwardingProtocol: 'HttpsOnly'
+    linkToDefaultDomain: 'Enabled'
+    httpsRedirect: 'Enabled'
+    enabledState: 'Enabled'
+  }
+  dependsOn: [
+    originUi
+  ]
+}
+
+// Route 3: /staging/* -> nginx with X-Backend-Host = staging-slot FQDN.
+// AFD strips /staging at the edge, nginx is a transparent header-driven proxy.
+resource routeNginxStaging 'Microsoft.Cdn/profiles/afdEndpoints/routes@2024-02-01' = {
+  parent: endpoint
+  name: 'route-nginx-staging'
+  properties: {
+    originGroup: {
+      id: ogNginx.id
+    }
+    ruleSets: [
+      {
+        id: ruleSetNginxStaging.id
+      }
+    ]
+    supportedProtocols: [
+      'Http'
+      'Https'
+    ]
+    patternsToMatch: [
+      '/staging'
+      '/staging/*'
+    ]
+    forwardingProtocol: 'HttpsOnly'
+    linkToDefaultDomain: 'Enabled'
+    httpsRedirect: 'Enabled'
+    enabledState: 'Enabled'
+  }
+  dependsOn: [
+    originNginx
+    ruleNginxStaging
+  ]
+}
+
+// Route 4: /* -> nginx with X-Backend-Host = prod FQDN (catch-all).
 resource routeNginx 'Microsoft.Cdn/profiles/afdEndpoints/routes@2024-02-01' = {
   parent: endpoint
   name: 'route-nginx'
@@ -216,6 +398,11 @@ resource routeNginx 'Microsoft.Cdn/profiles/afdEndpoints/routes@2024-02-01' = {
     originGroup: {
       id: ogNginx.id
     }
+    ruleSets: [
+      {
+        id: ruleSetNginxProd.id
+      }
+    ]
     supportedProtocols: [
       'Http'
       'Https'
@@ -230,6 +417,7 @@ resource routeNginx 'Microsoft.Cdn/profiles/afdEndpoints/routes@2024-02-01' = {
   }
   dependsOn: [
     originNginx
+    ruleNginxProd
   ]
 }
 

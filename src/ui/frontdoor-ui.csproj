@@ -1,0 +1,14 @@
+﻿<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>frontdoor-ui</AssemblyName>
+    <RootNamespace>FrontdoorUi</RootNamespace>
+    <UserSecretsId>c2568459-9452-46c1-bcc0-9ada6a12d4fb</UserSecretsId>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Identity.Web" Version="4.10.0" />
+    <PackageReference Include="Microsoft.Identity.Web.UI" Version="4.10.0" />
+  </ItemGroup>
+</Project>

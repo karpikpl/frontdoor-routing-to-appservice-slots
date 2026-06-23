@@ -30,6 +30,9 @@ output names object = {
 
   privateEndpointAppProd:    'pe-app-prod-${stem}'
   privateEndpointAppStaging: 'pe-app-staging-${stem}'
+  privateEndpointAppUi:      'pe-app-ui-${stem}'
+
+  appServiceUi:              'app-ui-${stem}'
 
   // ACA env names have a 32-char hard limit; keep this short.
   containerAppsEnvironment: 'cae-${stem}'

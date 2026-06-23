@@ -26,6 +26,7 @@ app.MapGet("/api/whoami", (HttpContext ctx) => Results.Json(new
     activeSlotName = ActiveSlot(),
     host           = ctx.Request.Host.Value,
     path           = ctx.Request.Path.Value,
+    proxiedBy      = ctx.Request.Headers["X-Proxied-By"].ToString(),
     machineName    = MachineName(),
     utc            = DateTime.UtcNow,
 }));
@@ -33,6 +34,10 @@ app.MapGet("/api/whoami", (HttpContext ctx) => Results.Json(new
 app.MapGet("/{**catchall}", (HttpContext ctx) =>
 {
     var color = Color();
+    var proxiedBy = ctx.Request.Headers["X-Proxied-By"].ToString();
+    var proxyBadge = string.IsNullOrEmpty(proxiedBy)
+        ? "<p><em>Direct from AFD (no proxy)</em></p>"
+        : $"<p>🔀 <strong>Proxied by {System.Net.WebUtility.HtmlEncode(proxiedBy)}</strong></p>";
     var bg = color switch
     {
         "blue"  => "#dbeafe",
@@ -68,6 +73,7 @@ app.MapGet("/{**catchall}", (HttpContext ctx) =>
   <div class="card">
     <h1>App Service slot: <span class="pill">{{SlotRole()}}</span></h1>
     <p>Color: <strong>{{color}}</strong></p>
+    {{proxyBadge}}
     <dl>
       <dt>SLOT_ROLE</dt><dd>{{SlotRole()}}</dd>
       <dt>DEPLOYMENT_COLOR</dt><dd>{{color}}</dd>

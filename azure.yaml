@@ -27,38 +27,128 @@ services:
     project: ./src/app
     language: dotnet
     host: appservice
+  ui:
+    project: ./src/ui
+    language: dotnet
+    host: appservice
 
 hooks:
-  # Capture the current public IP so the Bicep deployment can whitelist it on
-  # the App Service SCM/Kudu endpoint. Without this, `azd deploy` cannot push
-  # to the private web app (publicNetworkAccess=Enabled but main-site denies
-  # all public, SCM allows only $MY_IP).
+  # Capture the current public IP (for SCM whitelisting) AND ensure an Entra
+  # app registration exists for the /ui MVC app. Both are persisted as azd
+  # env vars and consumed by main.bicepparam.
   preprovision:
     posix:
       shell: sh
       continueOnError: false
       interactive: false
       run: |
-        set +e
-        myIP=$(curl -s https://api.ipify.org)
+        set -e
+        echo "==> Capturing deployer public IP..."
+        myIP=$(curl -s https://api.ipify.org || true)
         if [ -z "$myIP" ]; then
-          echo "Warning: Could not retrieve public IP from ipify."
+          echo "Warning: could not retrieve public IP from ipify."
         fi
         echo "MY_IP=$myIP"
         azd env set MY_IP "$myIP"
-        set -e
+
+        # `azd deploy` refuses to pick a slot when multiple are detected.
+        # Force the production slot for service "app"; the staging slot is
+        # populated by the postdeploy hook (`az webapp deploy --slot staging`).
+        azd env set AZD_DEPLOY_APP_SLOT_NAME production
+
+        echo "==> Ensuring Entra app registration for the /ui app..."
+        tenantId=$(az account show --query tenantId -o tsv)
+        appName="fdr-ui-${AZURE_ENV_NAME:-dev}"
+        existing=$(azd env get-value AZURE_CLIENT_ID 2>/dev/null || true)
+        if [ -n "$existing" ] && az ad app show --id "$existing" >/dev/null 2>&1; then
+          appId="$existing"
+          echo "Reusing existing app registration $appId"
+        else
+          appId=$(az ad app list --display-name "$appName" --query "[0].appId" -o tsv)
+          if [ -z "$appId" ]; then
+            echo "Creating new app registration '$appName'..."
+            appId=$(az ad app create \
+              --display-name "$appName" \
+              --sign-in-audience AzureADMyOrg \
+              --enable-id-token-issuance true \
+              --query appId -o tsv)
+          else
+            echo "Found existing app registration by name: $appId"
+            az ad app update --id "$appId" --enable-id-token-issuance true >/dev/null
+          fi
+        fi
+
+        echo "==> Resetting client secret..."
+        secret=$(az ad app credential reset --id "$appId" \
+          --display-name "azd-$(date +%Y%m%d-%H%M%S)" \
+          --years 1 --query password -o tsv)
+
+        azd env set AZURE_CLIENT_ID "$appId"
+        azd env set AZURE_TENANT_ID "$tenantId"
+        azd env set AZURE_CLIENT_SECRET "$secret"
+        echo "Entra config ready: clientId=$appId tenantId=$tenantId"
     windows:
       shell: pwsh
       continueOnError: false
       interactive: false
       run: |
-        try {
-          $myIP = $(Invoke-WebRequest -Uri "https://api.ipify.org" -ErrorAction Stop).Content
-        } catch {
-          Write-Warning "Could not retrieve public IP from ipify. Setting MY_IP to empty."
-          $myIP = ""
-        }
+        Write-Host "==> Capturing deployer public IP..."
+        try { $myIP = (Invoke-WebRequest -Uri 'https://api.ipify.org' -ErrorAction Stop).Content }
+        catch { Write-Warning "Could not retrieve public IP."; $myIP = '' }
         azd env set MY_IP $myIP
+        azd env set AZD_DEPLOY_APP_SLOT_NAME production
+
+        Write-Host "==> Ensuring Entra app registration for the /ui app..."
+        $tenantId = (az account show --query tenantId -o tsv)
+        $appName = "fdr-ui-$($env:AZURE_ENV_NAME ?? 'dev')"
+        $existing = (azd env get-value AZURE_CLIENT_ID 2>$null)
+        if ($existing -and (az ad app show --id $existing 2>$null)) {
+          $appId = $existing
+        } else {
+          $appId = (az ad app list --display-name $appName --query "[0].appId" -o tsv)
+          if (-not $appId) {
+            $appId = (az ad app create --display-name $appName --sign-in-audience AzureADMyOrg --enable-id-token-issuance true --query appId -o tsv)
+          } else {
+            az ad app update --id $appId --enable-id-token-issuance true | Out-Null
+          }
+        }
+        $secret = (az ad app credential reset --id $appId --display-name "azd-$(Get-Date -Format yyyyMMdd-HHmmss)" --years 1 --query password -o tsv)
+        azd env set AZURE_CLIENT_ID $appId
+        azd env set AZURE_TENANT_ID $tenantId
+        azd env set AZURE_CLIENT_SECRET $secret
+
+  # After provisioning, register the AFD-hosted redirect URI on the app reg
+  # (we can't know the AFD endpoint hostname until after Bicep runs).
+  postprovision:
+    posix:
+      shell: sh
+      continueOnError: false
+      interactive: false
+      run: |
+        set -e
+        if [ -z "$AFD_ENDPOINT_HOSTNAME" ] || [ -z "$AZURE_CLIENT_ID" ]; then
+          echo "AFD_ENDPOINT_HOSTNAME or AZURE_CLIENT_ID not set — skipping redirect URI update."
+          exit 0
+        fi
+        redirect="https://${AFD_ENDPOINT_HOSTNAME}/ui/signin-oidc"
+        logout="https://${AFD_ENDPOINT_HOSTNAME}/ui/signout-callback-oidc"
+        echo "==> Setting redirect URI on app $AZURE_CLIENT_ID to $redirect"
+        az ad app update --id "$AZURE_CLIENT_ID" \
+          --web-redirect-uris "$redirect" \
+          --web-home-page-url "https://${AFD_ENDPOINT_HOSTNAME}/ui/" \
+          --set "web.logoutUrl=$logout"
+    windows:
+      shell: pwsh
+      continueOnError: false
+      interactive: false
+      run: |
+        if (-not $env:AFD_ENDPOINT_HOSTNAME -or -not $env:AZURE_CLIENT_ID) {
+          Write-Host "AFD_ENDPOINT_HOSTNAME or AZURE_CLIENT_ID not set — skipping."
+          exit 0
+        }
+        $redirect = "https://$($env:AFD_ENDPOINT_HOSTNAME)/ui/signin-oidc"
+        $logout   = "https://$($env:AFD_ENDPOINT_HOSTNAME)/ui/signout-callback-oidc"
+        az ad app update --id $env:AZURE_CLIENT_ID --web-redirect-uris $redirect --web-home-page-url "https://$($env:AFD_ENDPOINT_HOSTNAME)/ui/" --set "web.logoutUrl=$logout"
 
   # After azd deploys to the production slot, publish the same build to the
   # staging slot so blue/green works out of the box.

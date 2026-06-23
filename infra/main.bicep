@@ -40,6 +40,16 @@ param environmentName string = 'dev'
 @description('Public IP (no CIDR) of the deployer. Whitelisted on the App Service SCM/Kudu endpoint so `azd deploy` can push the zip while the main site stays private. Populated by the preprovision hook in azure.yaml.')
 param myIpAddress string = ''
 
+@description('Entra app registration (single-tenant) client ID for the UI app. Created by the preprovision hook in azure.yaml.')
+param entraClientId string = ''
+
+@description('Entra tenant ID where the UI app registration lives.')
+param entraTenantId string = ''
+
+@secure()
+@description('Entra app registration client secret. Populated by the preprovision hook in azure.yaml; deployed as a plain App Setting (demo-grade; move to Key Vault for production).')
+param entraClientSecret string = ''
+
 @description('Optional override for the deterministic name token. Leave default for stable per-RG hashing.')
 param resourceToken string = take(uniqueString(resourceGroup().id), 8)
 
@@ -160,16 +170,31 @@ module nginxApp 'modules/nginx-container-app.bicep' = {
     name: names.outputs.names.nginxContainerApp
     containerAppsEnvironmentId: acaEnv.outputs.id
     workloadProfileName: acaEnv.outputs.workloadProfileName
-    appProdHost: appService.outputs.appServiceDefaultHostName
-    appStagingHost: appService.outputs.slotDefaultHostName
     tags: tags
   }
-  // Ensure private endpoints + DNS exist so the nginx pod can resolve the
-  // App Service hostnames privately as soon as it boots.
-  dependsOn: [
-    appServicePe
-    privateDns
-  ]
+  // No longer depends on App Service hostnames — AFD injects them per-request.
+  dependsOn: []
+}
+
+// ---------------------------------------------------------------------------
+// UI web app (ASP.NET MVC + Entra Auth) — same App Service Plan, no slot.
+// ---------------------------------------------------------------------------
+module appServiceUi 'modules/app-service-ui.bicep' = {
+  name: 'appServiceUi'
+  params: {
+    location: location
+    appServicePlanId: appService.outputs.appServicePlanId
+    appServiceName: names.outputs.names.appServiceUi
+    peSubnetId: vnet.outputs.subnetPeId
+    vnetIntegrationSubnetId: vnet.outputs.subnetAspIntegrationId
+    privateEndpointName: names.outputs.names.privateEndpointAppUi
+    privateDnsZoneId: privateDns.outputs.appServiceZoneId
+    myIpAddress: myIpAddress
+    entraClientId: entraClientId
+    entraTenantId: entraTenantId
+    entraClientSecret: entraClientSecret
+    tags: tags
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -182,8 +207,11 @@ module frontDoor 'modules/front-door.bicep' = {
     frontDoorEndpointName: names.outputs.names.frontDoorEndpoint
     appServiceResourceId: appService.outputs.appServiceResourceId
     appServiceHostName: appService.outputs.appServiceDefaultHostName
+    appServiceStagingHostName: appService.outputs.slotDefaultHostName
     managedEnvironmentResourceId: acaEnv.outputs.id
     nginxContainerAppHostName: nginxApp.outputs.fqdn
+    appServiceUiResourceId: appServiceUi.outputs.appServiceResourceId
+    appServiceUiHostName: appServiceUi.outputs.appServiceDefaultHostName
     logAnalyticsWorkspaceId: monitoring.outputs.workspaceId
     tags: tags
   }
@@ -207,5 +235,10 @@ output CONTAINER_APPS_ENVIRONMENT_NAME    string = acaEnv.outputs.name
 output CONTAINER_APPS_ENVIRONMENT_DOMAIN  string = acaEnv.outputs.defaultDomain
 output NGINX_CONTAINER_APP_NAME           string = nginxApp.outputs.name
 output NGINX_CONTAINER_APP_FQDN           string = nginxApp.outputs.fqdn
+
+output UI_APP_SERVICE_NAME             string = appServiceUi.outputs.appServiceName
+output UI_APP_SERVICE_DEFAULT_HOSTNAME string = appServiceUi.outputs.appServiceDefaultHostName
+output AZURE_CLIENT_ID                 string = entraClientId
+output AZURE_TENANT_ID                 string = entraTenantId
 
 output VNET_NAME string = vnet.outputs.vnetName
