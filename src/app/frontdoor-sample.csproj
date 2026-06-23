@@ -1,0 +1,12 @@
+﻿<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>FrontdoorSample</RootNamespace>
+    <AssemblyName>frontdoor-sample</AssemblyName>
+    <UserSecretsId>ad92db52-ed4e-44f8-a261-d0007c129c16</UserSecretsId>
+  </PropertyGroup>
+
+</Project>

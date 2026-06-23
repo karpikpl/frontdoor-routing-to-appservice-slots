@@ -1,0 +1,111 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Azure/azure-dev/main/schemas/v1.0/azure.yaml.json
+#
+# Front Door Premium → App Service (private link, blue/green slots) +
+# nginx Container App side-route.
+#
+# `azd up` will:
+#   1. Provision infra (VNet, App Service + staging slot, ACA env, nginx,
+#      Front Door Premium with shared private links).
+#   2. Deploy the .NET 8 sample app to the production slot.
+#   3. Postdeploy hook republishes the same artifact to the staging slot.
+#
+# Both slots run the same image but have slot-sticky env vars
+# (SLOT_ROLE, DEPLOYMENT_COLOR, ACTIVE_SLOT_NAME) so the page surfaces
+# whether it's serving from blue (production) or green (staging).
+#
+name: frontdoor-routing
+metadata:
+  template: frontdoor-routing@0.0.1
+
+infra:
+  provider: bicep
+  path: infra
+  module: main
+
+services:
+  app:
+    project: ./src/app
+    language: dotnet
+    host: appservice
+
+hooks:
+  # Capture the current public IP so the Bicep deployment can whitelist it on
+  # the App Service SCM/Kudu endpoint. Without this, `azd deploy` cannot push
+  # to the private web app (publicNetworkAccess=Enabled but main-site denies
+  # all public, SCM allows only $MY_IP).
+  preprovision:
+    posix:
+      shell: sh
+      continueOnError: false
+      interactive: false
+      run: |
+        set +e
+        myIP=$(curl -s https://api.ipify.org)
+        if [ -z "$myIP" ]; then
+          echo "Warning: Could not retrieve public IP from ipify."
+        fi
+        echo "MY_IP=$myIP"
+        azd env set MY_IP "$myIP"
+        set -e
+    windows:
+      shell: pwsh
+      continueOnError: false
+      interactive: false
+      run: |
+        try {
+          $myIP = $(Invoke-WebRequest -Uri "https://api.ipify.org" -ErrorAction Stop).Content
+        } catch {
+          Write-Warning "Could not retrieve public IP from ipify. Setting MY_IP to empty."
+          $myIP = ""
+        }
+        azd env set MY_IP $myIP
+
+  # After azd deploys to the production slot, publish the same build to the
+  # staging slot so blue/green works out of the box.
+  postdeploy:
+    posix:
+      shell: sh
+      continueOnError: false
+      interactive: false
+      run: |
+        set -e
+        if [ -z "$APP_SERVICE_NAME" ] || [ -z "$AZURE_RESOURCE_GROUP" ]; then
+          echo "APP_SERVICE_NAME or AZURE_RESOURCE_GROUP not set — skipping staging slot deploy."
+          exit 0
+        fi
+        echo "Publishing src/app to staging slot of $APP_SERVICE_NAME..."
+        rm -rf /tmp/fdr-publish /tmp/fdr-publish.zip
+        dotnet publish src/app -c Release -o /tmp/fdr-publish --nologo
+        (cd /tmp/fdr-publish && zip -qr /tmp/fdr-publish.zip .)
+        az webapp deploy \
+          --resource-group "$AZURE_RESOURCE_GROUP" \
+          --name "$APP_SERVICE_NAME" \
+          --slot staging \
+          --src-path /tmp/fdr-publish.zip \
+          --type zip \
+          --async false
+        echo "Staging slot deploy complete."
+    windows:
+      shell: pwsh
+      continueOnError: false
+      interactive: false
+      run: |
+        if (-not $env:APP_SERVICE_NAME -or -not $env:AZURE_RESOURCE_GROUP) {
+          Write-Host "APP_SERVICE_NAME or AZURE_RESOURCE_GROUP not set — skipping staging slot deploy."
+          exit 0
+        }
+        Write-Host "Publishing src/app to staging slot of $($env:APP_SERVICE_NAME)..."
+        $pub = Join-Path $env:TEMP 'fdr-publish'
+        $zip = Join-Path $env:TEMP 'fdr-publish.zip'
+        if (Test-Path $pub) { Remove-Item -Recurse -Force $pub }
+        if (Test-Path $zip) { Remove-Item -Force $zip }
+        dotnet publish src/app -c Release -o $pub --nologo
+        Compress-Archive -Path (Join-Path $pub '*') -DestinationPath $zip -Force
+        az webapp deploy `
+          --resource-group $env:AZURE_RESOURCE_GROUP `
+          --name $env:APP_SERVICE_NAME `
+          --slot staging `
+          --src-path $zip `
+          --type zip `
+          --async false
+        Write-Host "Staging slot deploy complete."
