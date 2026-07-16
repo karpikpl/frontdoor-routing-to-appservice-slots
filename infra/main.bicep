@@ -161,6 +161,18 @@ module appServicePe 'modules/app-service-pe.bicep' = {
 }
 
 // ---------------------------------------------------------------------------
+// Front Door PROFILE (created early so nginx can consume its frontDoorId for
+// origin authentication via the X-Azure-FDID header).
+// ---------------------------------------------------------------------------
+module frontDoorProfile 'modules/front-door-profile.bicep' = {
+  name: 'frontDoorProfile'
+  params: {
+    frontDoorProfileName: names.outputs.names.frontDoorProfile
+    tags: tags
+  }
+}
+
+// ---------------------------------------------------------------------------
 // nginx Container App (depends on App Service hostnames + ACA env)
 // ---------------------------------------------------------------------------
 module nginxApp 'modules/nginx-container-app.bicep' = {
@@ -170,6 +182,7 @@ module nginxApp 'modules/nginx-container-app.bicep' = {
     name: names.outputs.names.nginxContainerApp
     containerAppsEnvironmentId: acaEnv.outputs.id
     workloadProfileName: acaEnv.outputs.workloadProfileName
+    expectedFrontDoorId: frontDoorProfile.outputs.frontDoorId
     tags: tags
   }
   // No longer depends on App Service hostnames — AFD injects them per-request.

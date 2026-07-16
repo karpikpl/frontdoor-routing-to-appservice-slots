@@ -22,13 +22,17 @@ param name string
 param containerAppsEnvironmentId string
 param workloadProfileName string = 'Consumption'
 
+@description('The Front Door instance ID (GUID from profile.properties.frontDoorId). AFD injects this on every request as X-Azure-FDID; nginx rejects requests where it does not match, so only THIS Front Door instance can reach the proxy.')
+param expectedFrontDoorId string
+
 @description('Min replicas (1 keeps the proxy always-on so first request to Front Door is fast).')
 param minReplicas int = 1
 param maxReplicas int = 2
 
-// Static nginx config — no envsubst needed since AFD provides the target host
-// dynamically per request via X-Backend-Host. Variable names with $ are
-// nginx-native and stay literal.
+// Static nginx config — no envsubst needed. AFD provides the target host
+// dynamically per request via X-Backend-Host, and AFD's own instance ID via
+// X-Azure-FDID (validated below to prove the request came from OUR Front Door
+// instance and not somewhere else that discovered the ACA FQDN).
 var nginxConfTemplate = '''
 server {
     listen 8080 default_server;
@@ -43,7 +47,22 @@ server {
     absolute_redirect off;
     port_in_redirect  off;
 
-    # Health probe consumed by AFD origin health check.
+    # -----------------------------------------------------------------------
+    # Front Door origin authentication.
+    # AFD stamps every request to the origin with X-Azure-FDID = the profile's
+    # unique frontDoorId GUID. We compare against the value baked in at deploy
+    # time (__EXPECTED_FDID__) and 403 anything else. Combined with the ACA
+    # env being internal + reachable only via Shared Private Link, this proves
+    # the request came from THIS Front Door instance.
+    # -----------------------------------------------------------------------
+    set $expected_fdid "__EXPECTED_FDID__";
+    map $http_x_azure_fdid $fdid_ok {
+        default          0;
+        "__EXPECTED_FDID__" 1;
+    }
+
+    # Health probe consumed by AFD origin health check. Skip FDID check —
+    # AFD's health prober does NOT send X-Azure-FDID.
     location = /healthz {
         access_log off;
         return 200 "ok\n";
@@ -55,7 +74,7 @@ server {
         access_log off;
         add_header Content-Type text/plain always;
         add_header X-Echo-Backend "$http_x_backend_host" always;
-        return 200 "x-backend-host=[$http_x_backend_host]\nhost=[$http_host]\nx-azure-ref=[$http_x_azure_ref]\nx-forwarded-host=[$http_x_forwarded_host]\nuri=[$request_uri]\n";
+        return 200 "x-backend-host=[$http_x_backend_host]\nhost=[$http_host]\nx-azure-ref=[$http_x_azure_ref]\nx-azure-fdid=[$http_x_azure_fdid]\nfdid-ok=[$fdid_ok]\nx-forwarded-host=[$http_x_forwarded_host]\nuri=[$request_uri]\n";
     }
 
     # Strip the /staging prefix before proxying. AFD's UrlRewrite action proved
@@ -65,6 +84,9 @@ server {
         return 302 /staging/;
     }
     location ^~ /staging/ {
+        if ($fdid_ok = 0) {
+            return 403 "Forbidden: request did not come from expected Front Door instance\n";
+        }
         if ($http_x_backend_host = "") {
             return 400 "Missing X-Backend-Host header\n";
         }
@@ -94,6 +116,9 @@ server {
     }
 
     location / {
+        if ($fdid_ok = 0) {
+            return 403 "Forbidden: request did not come from expected Front Door instance\n";
+        }
         # AFD must inject X-Backend-Host. Refuse otherwise — that means the
         # request bypassed our AFD rule sets, which shouldn't be possible.
         if ($http_x_backend_host = "") {
@@ -129,6 +154,10 @@ server {
 }
 '''
 
+// Substitute the expected FDID into the template. Two occurrences: the `set`
+// (kept for /__debug echo) and the `map` (used for enforcement).
+var nginxConf = replace(nginxConfTemplate, '__EXPECTED_FDID__', expectedFrontDoorId)
+
 resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
   name: name
   location: location
@@ -154,7 +183,7 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
         {
           name: 'nginx-conf-template'
           #disable-next-line use-secure-value-for-secure-inputs
-          value: nginxConfTemplate
+          value: nginxConf
         }
       ]
     }
@@ -162,7 +191,7 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
       // The template hash is embedded as a label so any change to the nginx
       // config forces a new ACA revision (otherwise secret-value changes
       // alone don't trigger a restart).
-      revisionSuffix: 'cfg-${substring(uniqueString(nginxConfTemplate), 0, 8)}'
+      revisionSuffix: 'cfg-${substring(uniqueString(nginxConf), 0, 8)}'
       initContainers: [
         {
           name: 'nginx-conf-renderer'

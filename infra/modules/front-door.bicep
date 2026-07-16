@@ -37,19 +37,11 @@ param appServiceUiHostName string
 @description('Log Analytics workspace resource ID for AFD diagnostic settings.')
 param logAnalyticsWorkspaceId string
 
-// SKU must be Premium for shared private link.
-var sku = 'Premium_AzureFrontDoor'
-
 // ---------------------------------------------------------------------------
-// Profile + endpoint
+// Profile (created by front-door-profile module) + endpoint
 // ---------------------------------------------------------------------------
-resource profile 'Microsoft.Cdn/profiles@2024-02-01' = {
+resource profile 'Microsoft.Cdn/profiles@2024-02-01' existing = {
   name: frontDoorProfileName
-  location: location
-  sku: {
-    name: sku
-  }
-  tags: tags
 }
 
 resource endpoint 'Microsoft.Cdn/profiles/afdEndpoints@2024-02-01' = {
@@ -229,8 +221,8 @@ resource ruleStripDirect 'Microsoft.Cdn/profiles/ruleSets/rules@2024-02-01' = {
 // ---------------------------------------------------------------------------
 // Rule set: route /staging/* through nginx, injecting X-Backend-Host so nginx
 // proxies to the staging slot. Also strips the /staging prefix so nginx sees
-// the original app path. Header is set with action=Overwrite, so any client-
-// supplied X-Backend-Host is discarded by AFD — nginx can trust it.
+// the original app path. Any client-supplied X-Backend-Host is DELETED first,
+// then AFD appends the authoritative value — nginx can trust the result.
 // ---------------------------------------------------------------------------
 resource ruleSetNginxStaging 'Microsoft.Cdn/profiles/ruleSets@2024-02-01' = {
   parent: profile
@@ -254,6 +246,16 @@ resource ruleNginxStaging 'Microsoft.Cdn/profiles/ruleSets/rules@2024-02-01' = {
           preserveUnmatchedPath: true
         }
       }
+      // Strip any client-supplied X-Backend-Host to prevent header spoofing
+      // (SSRF vector). AFD's Delete action removes ALL occurrences.
+      {
+        name: 'ModifyRequestHeader'
+        parameters: {
+          typeName: 'DeliveryRuleHeaderActionParameters'
+          headerAction: 'Delete'
+          headerName: 'X-Backend-Host'
+        }
+      }
       {
         name: 'ModifyRequestHeader'
         parameters: {
@@ -269,7 +271,8 @@ resource ruleNginxStaging 'Microsoft.Cdn/profiles/ruleSets/rules@2024-02-01' = {
 
 // ---------------------------------------------------------------------------
 // Rule set: catch-all route through nginx, injecting X-Backend-Host so nginx
-// proxies to the production slot. No path rewrite — pass through.
+// proxies to the production slot. No path rewrite — pass through. Same
+// Delete-then-Append pattern to defeat client-supplied header spoofing.
 // ---------------------------------------------------------------------------
 resource ruleSetNginxProd 'Microsoft.Cdn/profiles/ruleSets@2024-02-01' = {
   parent: profile
@@ -284,6 +287,14 @@ resource ruleNginxProd 'Microsoft.Cdn/profiles/ruleSets/rules@2024-02-01' = {
     matchProcessingBehavior: 'Continue'
     conditions: []
     actions: [
+      {
+        name: 'ModifyRequestHeader'
+        parameters: {
+          typeName: 'DeliveryRuleHeaderActionParameters'
+          headerAction: 'Delete'
+          headerName: 'X-Backend-Host'
+        }
+      }
       {
         name: 'ModifyRequestHeader'
         parameters: {
