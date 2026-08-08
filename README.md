@@ -106,7 +106,7 @@ location / {
 
 The slot FQDN (`*-staging.azurewebsites.net`) resolves inside the VNet to the staging slot's private endpoint IP — via the `privatelink.azurewebsites.net` private DNS zone linked to the VNet. nginx never touches the public internet.
 
-**Why this is safe:** nginx is reachable *only* through AFD's Shared Private Link. There's no way for an end user to hit nginx directly and spoof `X-Backend-Host`. AFD's `Append` action runs at the edge, after the client request is fully terminated. The nginx config also allow-lists the header suffix as a belt-and-braces SSRF guard.
+**Why this is safe:** nginx is reachable *only* through AFD's Shared Private Link and rejects every non-health request whose `X-Azure-FDID` does not match this deployment's Front Door profile. AFD deletes any client-supplied `X-Backend-Host` before appending the authoritative backend, and nginx strictly allow-lists App Service hostnames as a belt-and-braces SSRF guard.
 
 **Adding a third slot / route?** It's two AFD primitives: a route (pattern → origin group) and a one-action rule set (`Append X-Backend-Host = <hostname>`). nginx doesn't change.
 
@@ -214,6 +214,7 @@ These are the things that ate the most time while building this — calling them
 | Symptom | Cause | Fix |
 |---|---|---|
 | Can't create an AFD Shared Private Link to a slot | [Not supported](https://learn.microsoft.com/en-us/azure/frontdoor/standard-premium/how-to-enable-private-link-web-app) — only the `sites` sub-resource is allowed | This whole repo 🙂 — route via an intermediary that *is* a supported SPL target (ACA) |
+| AFD returns `504 OriginTimeout` for every route after provisioning | AFD Shared Private Link requests are still pending approval on the ACA environment and App Services | Run `azd provision` again with the current `postprovision` hook, or approve the three pending connections on their target resources |
 | AFD rule says `ModifyRequestHeader Overwrite`, but header never reaches origin | `Overwrite` is a no-op when the header doesn't already exist on the request (despite what the docs imply) | Use `headerAction: 'Append'` |
 | AFD `UrlRewrite` action silently doesn't rewrite | Reliability issue with the rules engine for nginx-bound routes | Do path stripping in nginx (`rewrite ^/staging/(.*)$ /$1 break;`) |
 | `azd deploy` hangs forever on "Checking deployment slots" | `publicNetworkAccess: Disabled` also blocks SCM/Kudu (which azd talks to) | Set `publicNetworkAccess: Enabled` but use `ipSecurityRestrictions` deny-all on main + `scmIpSecurityRestrictions` allow `MY_IP` on SCM. AFD's Shared Private Link bypasses these IP rules. |
@@ -267,7 +268,7 @@ location / {
 }
 ```
 
-**Why this is safe:** nginx is reachable *only* through AFD's Shared Private Link. There's no way for an end user to hit nginx directly and spoof `X-Backend-Host`. AFD's `Append` action runs at the edge, after the client request is fully terminated.
+**Why this is safe:** nginx is reachable *only* through AFD's Shared Private Link and rejects every non-health request whose `X-Azure-FDID` does not match this deployment's Front Door profile. AFD deletes any client-supplied `X-Backend-Host` before appending the authoritative backend, and nginx strictly allow-lists App Service hostnames as a belt-and-braces SSRF guard.
 
 **Adding a third slot / route?** It's two AFD primitives: a route (pattern → origin group) and a one-action rule set (`Append X-Backend-Host = <hostname>`). nginx doesn't change.
 
@@ -374,6 +375,7 @@ These are the things that ate the most time while building this — calling them
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| AFD returns `504 OriginTimeout` for every route after provisioning | AFD Shared Private Link requests are still pending approval on the ACA environment and App Services | Run `azd provision` again with the current `postprovision` hook, or approve the three pending connections on their target resources |
 | AFD rule says `ModifyRequestHeader Overwrite`, but header never reaches origin | `Overwrite` is a no-op when the header doesn't already exist on the request (despite what the docs imply) | Use `headerAction: 'Append'` |
 | AFD `UrlRewrite` action silently doesn't rewrite | Reliability issue with the rules engine for nginx-bound routes | Do path stripping in nginx (`rewrite ^/staging/(.*)$ /$1 break;`) |
 | `azd deploy` hangs forever on "Checking deployment slots" | `publicNetworkAccess: Disabled` also blocks SCM/Kudu (which azd talks to) | Set `publicNetworkAccess: Enabled` but use `ipSecurityRestrictions` deny-all on main + `scmIpSecurityRestrictions` allow `MY_IP` on SCM. AFD's Shared Private Link bypasses these IP rules. |
