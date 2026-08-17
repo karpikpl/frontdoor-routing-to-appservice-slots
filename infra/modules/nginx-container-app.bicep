@@ -3,10 +3,9 @@
 //
 // Architecture:
 //   * Azure Front Door owns all routing logic. For each route it injects an
-//     X-Backend-Host header (action=Overwrite, so client-supplied values are
-//     replaced — they can't be spoofed).
-//   * nginx blindly proxies to https://$http_x_backend_host. No path logic,
-//     no per-slot conditionals, no redirects.
+//     authoritative X-Backend-Host header after deleting client-supplied values.
+//   * nginx proxies to https://$http_x_backend_host and strips the /staging
+//     prefix as a fallback when AFD's URL rewrite does not take effect.
 //   * Only AFD can reach this Container App: the ACA env is VNet-injected
 //     and internal, and AFD reaches it via Shared Private Link (groupId
 //     'managedEnvironments'). So trusting the header is safe.
@@ -34,6 +33,11 @@ param maxReplicas int = 2
 // X-Azure-FDID (validated below to prove the request came from OUR Front Door
 // instance and not somewhere else that discovered the ACA FQDN).
 var nginxConfTemplate = '''
+map $http_x_azure_fdid $fdid_ok {
+    default             0;
+    "__EXPECTED_FDID__" 1;
+}
+
 server {
     listen 8080 default_server;
     server_name _;
@@ -47,6 +51,11 @@ server {
     absolute_redirect off;
     port_in_redirect  off;
 
+    # Validate the App Service certificate, not just its SNI name.
+    proxy_ssl_verify on;
+    proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+    proxy_ssl_verify_depth 2;
+
     # -----------------------------------------------------------------------
     # Front Door origin authentication.
     # AFD stamps every request to the origin with X-Azure-FDID = the profile's
@@ -55,12 +64,6 @@ server {
     # env being internal + reachable only via Shared Private Link, this proves
     # the request came from THIS Front Door instance.
     # -----------------------------------------------------------------------
-    set $expected_fdid "__EXPECTED_FDID__";
-    map $http_x_azure_fdid $fdid_ok {
-        default          0;
-        "__EXPECTED_FDID__" 1;
-    }
-
     # Health probe consumed by AFD origin health check. Skip FDID check —
     # AFD's health prober does NOT send X-Azure-FDID.
     location = /healthz {
@@ -69,18 +72,13 @@ server {
         add_header Content-Type text/plain;
     }
 
-    # Debug endpoint: echoes all headers nginx receives. Remove once verified.
-    location = /__debug {
-        access_log off;
-        add_header Content-Type text/plain always;
-        add_header X-Echo-Backend "$http_x_backend_host" always;
-        return 200 "x-backend-host=[$http_x_backend_host]\nhost=[$http_host]\nx-azure-ref=[$http_x_azure_ref]\nx-azure-fdid=[$http_x_azure_fdid]\nfdid-ok=[$fdid_ok]\nx-forwarded-host=[$http_x_forwarded_host]\nuri=[$request_uri]\n";
-    }
-
     # Strip the /staging prefix before proxying. AFD's UrlRewrite action proved
     # unreliable in our tests, so we do it here. Matches /staging exactly and
     # /staging/anything.
     location = /staging {
+        if ($fdid_ok = 0) {
+            return 403 "Forbidden: request did not come from expected Front Door instance\n";
+        }
         return 302 /staging/;
     }
     location ^~ /staging/ {
@@ -90,7 +88,7 @@ server {
         if ($http_x_backend_host = "") {
             return 400 "Missing X-Backend-Host header\n";
         }
-        if ($http_x_backend_host !~* "\.azurewebsites\.net$") {
+        if ($http_x_backend_host !~* "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.azurewebsites\.net$") {
             return 400 "Invalid X-Backend-Host\n";
         }
         set $backend $http_x_backend_host;
@@ -127,7 +125,7 @@ server {
         }
         # Allow-list backend host suffix to prevent SSRF if header validation
         # ever fails open.
-        if ($http_x_backend_host !~* "\.azurewebsites\.net$") {
+        if ($http_x_backend_host !~* "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.azurewebsites\.net$") {
             return 400 "Invalid X-Backend-Host\n";
         }
 
@@ -154,8 +152,7 @@ server {
 }
 '''
 
-// Substitute the expected FDID into the template. Two occurrences: the `set`
-// (kept for /__debug echo) and the `map` (used for enforcement).
+// Substitute the expected FDID into the map used by every non-health location.
 var nginxConf = replace(nginxConfTemplate, '__EXPECTED_FDID__', expectedFrontDoorId)
 
 resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {

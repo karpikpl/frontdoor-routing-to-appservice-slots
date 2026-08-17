@@ -117,8 +117,9 @@ hooks:
         azd env set AZURE_TENANT_ID $tenantId
         azd env set AZURE_CLIENT_SECRET $secret
 
-  # After provisioning, register the AFD-hosted redirect URI on the app reg
-  # (we can't know the AFD endpoint hostname until after Bicep runs).
+  # After provisioning, approve AFD's Shared Private Link requests and register
+  # the AFD-hosted redirect URI (neither can be completed inside the main Bicep
+  # deployment because the connection requests/hostname only exist afterward).
   postprovision:
     posix:
       shell: sh
@@ -126,6 +127,35 @@ hooks:
       interactive: false
       run: |
         set -e
+
+        approve_afd_connections() {
+          resource_type="$1"
+          resource_name="$2"
+          [ -z "$resource_name" ] && return
+
+          target_id=$(az resource show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --resource-type "$resource_type" \
+            --name "$resource_name" \
+            --query id -o tsv)
+          connection_ids=$(az network private-endpoint-connection list \
+            --id "$target_id" \
+            --query "[?properties.privateLinkServiceConnectionState.status=='Pending' && starts_with(properties.privateLinkServiceConnectionState.description, 'Front Door')].id" \
+            -o tsv)
+
+          for connection_id in $connection_ids; do
+            echo "==> Approving Front Door private connection on $resource_name"
+            az network private-endpoint-connection approve \
+              --id "$connection_id" \
+              --description "Approved automatically by azd postprovision" \
+              --output none
+          done
+        }
+
+        approve_afd_connections "Microsoft.App/managedEnvironments" "$CONTAINER_APPS_ENVIRONMENT_NAME"
+        approve_afd_connections "Microsoft.Web/sites" "$APP_SERVICE_NAME"
+        approve_afd_connections "Microsoft.Web/sites" "$UI_APP_SERVICE_NAME"
+
         if [ -z "$AFD_ENDPOINT_HOSTNAME" ] || [ -z "$AZURE_CLIENT_ID" ]; then
           echo "AFD_ENDPOINT_HOSTNAME or AZURE_CLIENT_ID not set — skipping redirect URI update."
           exit 0
@@ -142,6 +172,38 @@ hooks:
       continueOnError: false
       interactive: false
       run: |
+        function Approve-AfdConnections {
+          param(
+            [string]$ResourceType,
+            [string]$ResourceName
+          )
+          if (-not $ResourceName) { return }
+
+          $targetId = (az resource show `
+            --resource-group $env:AZURE_RESOURCE_GROUP `
+            --resource-type $ResourceType `
+            --name $ResourceName `
+            --query id -o tsv)
+          $connectionIds = @(az network private-endpoint-connection list `
+            --id $targetId `
+            --query "[?properties.privateLinkServiceConnectionState.status=='Pending' && starts_with(properties.privateLinkServiceConnectionState.description, 'Front Door')].id" `
+            -o tsv)
+
+          foreach ($connectionId in $connectionIds) {
+            if ($connectionId) {
+              Write-Host "==> Approving Front Door private connection on $ResourceName"
+              az network private-endpoint-connection approve `
+                --id $connectionId `
+                --description "Approved automatically by azd postprovision" `
+                --output none
+            }
+          }
+        }
+
+        Approve-AfdConnections "Microsoft.App/managedEnvironments" $env:CONTAINER_APPS_ENVIRONMENT_NAME
+        Approve-AfdConnections "Microsoft.Web/sites" $env:APP_SERVICE_NAME
+        Approve-AfdConnections "Microsoft.Web/sites" $env:UI_APP_SERVICE_NAME
+
         if (-not $env:AFD_ENDPOINT_HOSTNAME -or -not $env:AZURE_CLIENT_ID) {
           Write-Host "AFD_ENDPOINT_HOSTNAME or AZURE_CLIENT_ID not set — skipping."
           exit 0
